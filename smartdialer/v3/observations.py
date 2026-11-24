@@ -36,7 +36,7 @@ def record_status(
         if result != TransitionResult.APPLIED or status.state == CallState.CONNECTED:
             return result
 
-    if calls.restore_known_state(call, status.state):
+    if lease is not None and calls.restore_known_state(call, status.state):
         return TransitionResult.APPLIED
     return calls.advance(
         call.id, status.state, now, campaign, occurred_at=status.changed_at, lease=lease,

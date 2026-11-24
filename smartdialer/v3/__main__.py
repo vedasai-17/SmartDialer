@@ -4,17 +4,18 @@ import logging
 import os
 import time
 from collections.abc import Callable
+from pathlib import Path
 from uuid import uuid4
 
 from sqlalchemy import Connection, Engine, text
 
 from .agents import AgentState, AgentTransitions
-from .borrowers import BorrowerTransitions
 from .campaigns import read_campaign
 from .clock import Clock, SystemClock
 from .config import CampaignConfig, ExcessAnswerPolicy, Mode, Settings
 from .db import database
 from .dialer import Dialer
+from .seed import seed
 
 
 def positive(raw: str) -> int:
@@ -34,39 +35,6 @@ def run_loop(action: Callable[[], object], seconds: int | None, *, interval: flo
         except Exception as error:
             log("worker_iteration_failed", error_type=type(error).__name__)
         time.sleep(interval() if callable(interval) else interval)
-
-
-def seed(
-    connection: Connection, clock: Clock, name: str, agents: int, borrowers: int, config: CampaignConfig,
-    *, mode: Mode = Mode.STRICT_PROGRESSIVE, max_speculative_calls: int = 0, risk_budget: float = 0,
-    max_concurrent_calls: int | None = None, provider_rate_limit: int | None = None,
-) -> int:
-    campaign_id = connection.execute(
-        text("""
-            INSERT INTO campaigns (name, mode, max_concurrent_calls, provider_rate_limit, max_speculative_calls, risk_budget, config)
-            VALUES (:name, :mode, :concurrent, :rate, :speculative, :risk, CAST(:config AS jsonb)) RETURNING id
-        """),
-        dict(name=name, mode=mode, concurrent=agents if max_concurrent_calls is None else max_concurrent_calls,
-             rate=agents if provider_rate_limit is None else provider_rate_limit, speculative=max_speculative_calls,
-             risk=risk_budget, config=config.model_dump_json()),
-    ).scalar_one()
-    now = clock.now()
-    agent_transitions = AgentTransitions(connection)
-    borrower_transitions = BorrowerTransitions(connection)
-    for _ in range(agents):
-        agent_id = connection.execute(
-            text("INSERT INTO agents (campaign_id) VALUES (:id) RETURNING id"), {"id": campaign_id},
-        ).scalar_one()
-        if not agent_transitions.move(
-            agent_transitions.get(agent_id), AgentState.AVAILABLE, now,
-            login_ttl_seconds=config.heartbeat_ttl_seconds,
-        ):
-            raise RuntimeError("could not seed agent presence")
-    for offset in range(borrowers):
-        synthetic = f"999{campaign_id:06d}{offset:06d}"
-        if borrower_transitions.enqueue(campaign_id, synthetic, now) is None:
-            raise RuntimeError("synthetic borrower already exists")
-    return campaign_id
 
 
 def status(connection: Connection, campaign_id: int) -> dict[str, object]:
@@ -124,7 +92,28 @@ def main() -> None:
     mock = commands.add_parser("mock-config", help="change a shared mock provider profile")
     mock.add_argument("--provider", choices=("A", "B"), required=True)
     mock.add_argument("--set", action="append", default=[], metavar="FIELD=VALUE")
+    simulation = commands.add_parser("simulate", help="compare the three dialing tiers with a virtual clock and PostgreSQL")
+    simulation.add_argument("--scenario", choices=("all", "A", "B", "C", "D"), default="all")
+    simulation.add_argument("--provider", choices=("both", "A", "B"), default="both")
+    simulation.add_argument("--agents", type=positive, default=6)
+    simulation.add_argument("--seconds", type=positive, default=360)
+    simulation.add_argument("--warmup-seconds", type=positive, default=180)
+    simulation.add_argument("--cadence-seconds", type=positive, default=5)
+    simulation.add_argument("--seed", type=int, default=17)
+    simulation.add_argument("--jobs", type=positive, default=2)
+    simulation.add_argument("--report", type=Path)
+    simulation.add_argument("--require-acceptance", action="store_true")
+    load = commands.add_parser("load-test", help="measure concurrent allocation and webhook throughput")
+    load.add_argument("--agents", type=positive, default=100)
+    load.add_argument("--borrowers", type=positive)
+    load.add_argument("--workers", type=positive, default=4)
+    load.add_argument("--batch", type=positive, default=10)
+    load.add_argument("--timeout", type=positive, default=300)
+    load.add_argument("--report", type=Path)
     args = parser.parse_args()
+    if args.command in {"simulate", "load-test"}:
+        run_lab_command(args, Settings().database_url)
+        return
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     engine = database(Settings())
     clock = SystemClock()
@@ -214,6 +203,28 @@ def run_provider_command(args: argparse.Namespace, engine: Engine, clock: Clock,
             except json.JSONDecodeError:
                 overrides[field] = value
         print(providers[args.provider].configure(**overrides).model_dump_json())
+
+
+def run_lab_command(args: argparse.Namespace, url: str) -> None:
+    if args.command == "simulate":
+        from .simulation import SCENARIOS, SimulationConfig, compare, ladder
+
+        settings = SimulationConfig(args.seconds, args.warmup_seconds, args.agents, args.cadence_seconds, args.seed)
+        result = compare(url, settings, list(SCENARIOS) if args.scenario == "all" else [args.scenario],
+                         ["A", "B"] if args.provider == "both" else [args.provider], args.jobs)
+        print(ladder(result))
+        for acceptance in result["acceptance"]:
+            print(json.dumps(acceptance))
+    else:
+        from .load_test import load_test
+
+        result = load_test(url, args.agents, args.borrowers or args.agents * 2, args.workers, args.batch, args.timeout)
+        print(json.dumps(result, indent=2))
+    if args.report is not None:
+        args.report.parent.mkdir(parents=True, exist_ok=True)
+        args.report.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+    if args.command == "simulate" and args.require_acceptance and not all(row["passed"] for row in result["acceptance"]):
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

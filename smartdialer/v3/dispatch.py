@@ -97,7 +97,8 @@ class Dispatcher:
                             OR ({SPECULATION_CANCEL_REQUESTED})
                         )))
                     ORDER BY CASE WHEN a.state = 'RECOVERY_HOLD' THEN 0 WHEN c.state_rank = 50 THEN 1
-                                  WHEN c.state_rank > 20 THEN 2 ELSE 3 END, c.next_retry_at, c.id
+                                  WHEN c.state_rank > 20 THEN 2 ELSE 3 END, c.next_retry_at,
+                             c.campaign_id, c.borrower_id, c.attempt_number
                     LIMIT 1 FOR UPDATE OF c SKIP LOCKED
                 """),
                 {"now": now},
@@ -198,7 +199,7 @@ class Dispatcher:
             return Operation("bridge", agent_id=replacement) if replacement is not None else Operation("cancel")
         if (agent is None and not call.is_speculative) or (agent is not None and agent.state == AgentState.RECOVERY_HOLD):
             return Operation("cancel")
-        self._poll_later(calls, work, now)
+        self._poll_later(calls, work, now, answer_hold=campaign.config.answer_hold_seconds if call.state_rank < 50 else None)
         return None
 
     def _send(self, work: Work, operation: Operation, provider: TelecomProvider) -> None:
@@ -242,7 +243,8 @@ class Dispatcher:
                 if current.state_rank == 50:
                     calls.release_lease(work.lease, now, now)
                 else:
-                    self._poll_later(calls, work, now)
+                    self._poll_later(calls, work, now,
+                                     answer_hold=campaign.config.answer_hold_seconds if current.state_rank < 50 else None)
 
     def _uncertain(self, work: Work, operation: str, error: Exception) -> None:
         with self.engine.begin() as connection:
@@ -291,8 +293,12 @@ class Dispatcher:
             else:
                 self._defer(calls, call, work, campaign, now, "UNCONFIGURED_PROVIDER", "status")
 
-    def _poll_later(self, calls: CallTransitions, work: Work, now: datetime) -> None:
-        calls.release_lease(work.lease, now, now + timedelta(seconds=self.config.status_poll_seconds))
+    def _poll_later(self, calls: CallTransitions, work: Work, now: datetime, *, answer_hold: float | None = None) -> None:
+        interval = self.config.status_poll_seconds
+        if answer_hold is not None:
+            # A lost or reordered answer webhook must not outlast the provider's answer hold.
+            interval = min(interval, min(answer_hold, self.config.answer_hold_seconds) / 2)
+        calls.release_lease(work.lease, now, now + timedelta(seconds=interval))
 
     @staticmethod
     def _agent(calls: CallTransitions, call: RowMapping, campaign: Campaign, now: datetime) -> RowMapping | None:

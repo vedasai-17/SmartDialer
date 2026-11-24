@@ -50,4 +50,80 @@ The abandonment guard uses a rolling Wilson upper bound, a minimum sample size, 
 
 The breaker uses recent transport outcomes and setup latency from `call_events` and `calls`. It is evaluated per campaign and provider. `OPEN` blocks new starts. `HALF_OPEN` admits a bounded number of hard probes through Safety and allocation, and a failed probe reopens it. Successful probes restart the health window. Existing bridged calls keep their agents and continue to receive events during a provider outage. The dispatcher still reconciles calls in flight.
 
-The least certain parts are calibration during sudden shifts and the guarantees a real provider could make at bridge time. The mocks verify the fence and the reservation inside PostgreSQL. A real adapter needs an equivalent handoff plus authoritative absence and cancellation by client reference. Phase 4 will measure how often the guardrails activate, whether they keep abandonment within the configured threshold, and which scans dominate under load.
+The least certain parts are calibration during sudden shifts and the guarantees a real provider could make at bridge time. The mocks verify the fence and the reservation inside PostgreSQL. A real adapter needs an equivalent handoff plus authoritative absence and cancellation by client reference. The utilization and load numbers apply to the tested synthetic workload.
+
+## Architecture and state machines
+
+```mermaid
+flowchart LR
+    Pace[Pure pacing function] -->|Proposal| Safety[Safety Controller]
+    Safety -->|Single-use decision ID| Allocator
+    Allocator -->|Atomic reservation and call| PG[(PostgreSQL)]
+    PG -->|Call lease and fence| Dispatch[Dispatcher and reaper]
+    Dispatch -->|Stable client reference| Provider[Mock telecom provider]
+    Provider -->|Signed callback| Inbox[Webhook inbox]
+    Inbox -->|Durable receipt| PG
+    PG -->|Pending events| Processor[Event processor]
+    Processor -->|Monotone state transitions| PG
+    Dispatch -->|Atomic agent claim| Gate[Answer Gate]
+    Gate -->|Valid reservation| Dispatch
+    PG -->|Authoritative snapshot| Safety
+```
+
+```mermaid
+stateDiagram-v2
+    [*] --> OFFLINE
+    OFFLINE --> AVAILABLE: explicit login
+    AVAILABLE --> RESERVED: atomic call claim
+    AVAILABLE --> PAUSED: operator action
+    PAUSED --> AVAILABLE: resume
+    AVAILABLE --> OFFLINE: sign out or heartbeat expiry
+    RESERVED --> DIALING: provider accepts
+    DIALING --> CONNECTED: bridge confirmed
+    CONNECTED --> WRAP_UP: conversation ends
+    WRAP_UP --> AVAILABLE: deadline and valid heartbeat
+    RESERVED --> AVAILABLE: unbridged call settles
+    DIALING --> AVAILABLE: unbridged call settles
+    RESERVED --> RECOVERY_HOLD: agent unavailable
+    DIALING --> RECOVERY_HOLD: agent unavailable
+    CONNECTED --> RECOVERY_HOLD: agent unavailable
+    RECOVERY_HOLD --> OFFLINE: reconcile and release
+    RECOVERY_HOLD --> PAUSED: reconcile and release
+```
+
+```mermaid
+stateDiagram-v2
+    [*] --> RESERVED: approval consumed
+    RESERVED --> INITIATING: fenced start permit
+    INITIATING --> INITIATED: provider accepts
+    INITIATED --> RINGING
+    RINGING --> ANSWERED
+    ANSWERED --> CONNECTED: confirmed bridge with a reservation
+    CONNECTED --> TERMINAL: complete or cancel
+    RINGING --> TERMINAL: busy, no answer, or early completion
+    RESERVED --> TERMINAL: blocked before send
+    ANSWERED --> TERMINAL: unclaimed answer released
+    INITIATING --> UNKNOWN: response lost
+    RINGING --> UNKNOWN: cancel or status uncertain
+    ANSWERED --> UNKNOWN: bridge or cancel uncertain
+    UNKNOWN --> INITIATING: provider confirmed absence at rank 25
+    UNKNOWN --> RINGING: authoritative status at rank 40
+    UNKNOWN --> TERMINAL: terminal status confirmed
+```
+
+A terminal status may jump ahead from any active rank. `UNKNOWN` retains the last known rank. An authoritative status query can restore that rank. Webhook replays at the same rank are stale and do not repeat settlement.
+
+## Scaling from 100 to 100,000 agents
+
+| Agents | Likely first limit | Change after measuring |
+| --- | --- | --- |
+| 100 | Polling and the campaign admission lock dominate small batches. A burst of signed callbacks competes with leasing for PostgreSQL connections. | Keep transactions short. Measure pool wait, campaign-lock wait, and the age of the oldest dispatch and inbox work. |
+| 1,000 | Heartbeats update hot `agents` rows, creating dead tuples and vacuum work. A busy campaign's `SKIP LOCKED` query scans more occupied or locked candidates. | Separate liveness writes from reservation rows when MVCC churn justifies it. Batch reservation updates and inspect the eligibility plans and lock waits. |
+| 10,000 | One pacing loop per busy campaign and the admission lock serialize too much work. Each callback adds an inbox insert, a processing update, and state or audit writes. | Use a campaign advisory leader and partition allocation by campaign or independent agent pool. Batch event processing and partition `call_events` for retention. |
+| 100,000 | Event retention, WAL volume, and analytical queries compete with reservation traffic. Sharding by campaign moves phone deduplication and provider limits across shard boundaries. | Archive cold events and use read replicas for metrics. Keep reservation decisions on the authoritative shard and preserve a global suppression and deduplication authority. Enforce provider-wide limits where campaigns share a provider account. |
+
+A separate liveness table or TTL store could absorb high-frequency heartbeat traffic at scale. PostgreSQL would still own agent assignment. The prototype uses the current schema and a single database. The load results measure the local pipeline and do not establish capacity at the larger tiers.
+
+## What another week would buy
+
+Repeat the calibration with longer warm-ups and independent seeds, and compare against the live worker's polling cadence. Record query plans and lock wait distributions per campaign. Test retention, checkpoint pressure, and a provider adapter against explicit guarantees about cancellation, fencing, and earliest possible answer. The mock shares PostgreSQL with the dialer, so independent provider storage failure and network partition behavior remain outside this verification.

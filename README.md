@@ -1,6 +1,6 @@
 # SmartDialer
 
-## PostgreSQL v3 — Phase 3
+## PostgreSQL v3
 
 SmartDialer defaults to `STRICT_PROGRESSIVE`, with one eligible agent and borrower reserved per call. `HYBRID` can prepare a borrower shortlist and wake at a wrap-up deadline. With explicit opt-in, `BOUNDED_PREDICTIVE` and `HYBRID` can admit bounded speculative calls. The dispatcher leases committed calls, and the events process durably receives signed callbacks and serves metrics. Provider A and B are seeded synthetic mocks. [Design and trade-offs](docs/ADR.md)
 
@@ -50,13 +50,25 @@ Start the same dialer, dispatcher, and events workers with the new campaign ID. 
 
 `SAFE_TERMINATE` is the default excess-answer policy. Choose `SHORT_HOLD` to keep trying for a seat within a maximum of two seconds, or `PROGRESSIVE_FALLBACK` to stop speculative starts after an excess answer. An answer initially left unclaimed counts as an abandonment even if a short hold later finds an agent.
 
+### Run the simulator, load test, and red-team tests
+
+```powershell
+.\.venv\Scripts\python.exe -m smartdialer.v3 simulate --agents 6 --seconds 360 --warmup-seconds 180 --cadence-seconds 5 --seed 17 --jobs 4 --report .smartdialer/phase4-simulation.json
+.\.venv\Scripts\python.exe -m smartdialer.v3 load-test --agents 100 --borrowers 200 --workers 4 --batch 10 --report .smartdialer/phase4-load.json
+.\.venv\Scripts\python.exe -m pytest -q tests/v3/test_phase4.py
+.\.venv\Scripts\python.exe -m pytest -q tests
+```
+
+The simulator runs scenarios A–D on both mock providers at three utilization tiers. It prints the ladder, decision examples, and acceptance results. `--scenario D --provider B` narrows the comparison, and `--require-acceptance` exits nonzero when a measured comparison misses its target. The load test runs concurrent allocation requests and posts signed webhook replays through FastAPI. Both commands use isolated PostgreSQL schemas and check invariants after draining their calls. [Measured results](docs/RESULTS.md) · [Architecture and scale](docs/ADR.md) · [Discussion questions](docs/QA.md)
+
 ### How would you keep progressive safety while improving utilization?
 
 Reserve an agent and a borrower atomically for each hard-capacity call. Use forecasts to pre-select eligible borrowers and wake the dialer when wrap-up ends. Recheck availability in PostgreSQL before reserving. A future lead-time claim would need a provider-guaranteed earliest answer time and a reliable wrap-up deadline. An observed p1 latency still allows earlier answers, so it cannot establish a deterministic guarantee.
 
 Keep speculation off by default and give it a separate budget. When enabled, an independent Safety Controller uses a conservative answer estimate and a binomial overflow bound to limit unassigned calls. The Answer Gate must claim a fresh agent atomically before bridging. Count every unclaimed answer and fall back to progressive admission when the rolling abandonment bound breaches its guardrail or the forecasts become unreliable. Speculation bounds modeled risk and observed abandonment rates. Deterministic reservation safety comes from hard capacity.
 
-## Earlier SQLite prototype
+<details>
+<summary>Earlier SQLite prototype</summary>
 
 SmartDialer is a local collections dialer prototype with progressive and predictive pacing, transactional call admission, two mock telecom providers, and optional ML-based borrower ranking. It uses synthetic records and simulated calls.
 
@@ -156,3 +168,5 @@ python -m smartdialer demo
 ```
 
 Use the [five-minute walkthrough](docs/demo.md) for the expected output and discussion points. See [Architecture and decisions](docs/architecture.md) for the state diagrams, recovery sequence, scaling analysis, and final-question answer.
+
+</details>

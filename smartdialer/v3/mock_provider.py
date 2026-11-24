@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import Connection, Engine, RowMapping, text
 
 from .agents import AgentState, AgentTransitions
+from .borrowers import BorrowerState, BorrowerTransitions
 from .calls import RANK, CallState, CallTransitions, Lease
 from .campaigns import read_campaign
 from .clock import Clock
@@ -107,6 +108,7 @@ class MockProvider:
             if row is None or row.idempotency_key != client_reference or row.state_rank != 25:
                 raise ProviderRejected("initiation permit expired")
             agent = AgentTransitions(connection).get(row.agent_id, lock=True) if row.agent_id is not None else None
+            borrower = BorrowerTransitions(connection).get(row.borrower_id, lock=True)
             now = self.clock.now()
             if row.lease_until <= now or (agent is not None and (
                 agent.state not in {AgentState.RESERVED, AgentState.DIALING} or agent.lease_expires_at is None
@@ -118,6 +120,8 @@ class MockProvider:
                 raise ProviderRejected("campaign no longer permits this call")
             if not start_permitted(connection, row, campaign, now):
                 raise ProviderRejected("provider breaker blocks this call")
+            if borrower.state != BorrowerState.RESERVED or borrower.phone_normalized != phone:
+                raise ProviderRejected("borrower reservation was withdrawn")
             if not phone.startswith("999"):
                 raise ProviderRejected("mock accepts synthetic 999-prefix numbers only")
             transport = Random(f"{self.seed}:{self.name}:{client_reference}:send:{row.dispatch_attempts}")
@@ -181,6 +185,7 @@ class MockProvider:
             if row is None or row.idempotency_key != client_reference or row.state_rank != 50 or row.agent_id != agent_id:
                 raise ProviderRejected("bridge permit expired or its agent changed")
             agent = AgentTransitions(connection).get(agent_id, lock=True)
+            borrower = BorrowerTransitions(connection).get(row.borrower_id, lock=True)
             campaign = read_campaign(connection, row.campaign_id)
             now = self.clock.now()
             current = self._snapshot(client_reference, records, now)
@@ -188,6 +193,8 @@ class MockProvider:
                 return current
             if row.lease_until <= now or campaign is None or not CallTransitions.ready_to_bridge(row, agent, now, campaign):
                 raise ProviderRejected("agent does not hold a fresh bridge reservation")
+            if borrower.state != BorrowerState.RESERVED:
+                raise ProviderRejected("borrower reservation was withdrawn")
             self._record(connection, f"{client_reference}:bridge", "MOCK_BRIDGE", now, {"at": now.isoformat(), "agent_id": agent_id})
             result = replace(current, state=CallState.CONNECTED, changed_at=now, connected_at=now, agent_id=agent_id)
             accepted = MockCall.model_validate(records["accept"])
