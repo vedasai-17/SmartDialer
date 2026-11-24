@@ -65,7 +65,7 @@ class CallTransitions:
         self.clock = clock
 
     def reserve(
-        self, campaign: Campaign, borrower: RowMapping, agent_id: int, approval_id: int, now: datetime,
+        self, campaign: Campaign, borrower: RowMapping, agent_id: int | None, approval_id: int, now: datetime,
     ) -> UUID:
         call_id = uuid4()
         attempt = borrower.attempts + 1
@@ -73,16 +73,16 @@ class CallTransitions:
             text("""
                 INSERT INTO calls (
                     id, campaign_id, borrower_id, agent_id, safety_decision_id, idempotency_key,
-                    state, state_rank, provider, attempt_number, created_at, next_retry_at
+                    state, state_rank, provider, attempt_number, created_at, next_retry_at, is_speculative
                 ) VALUES (
                     :id, :campaign_id, :borrower_id, :agent_id, :approval_id, :key,
-                    'RESERVED', 20, :provider, :attempt, :now, :now
+                    'RESERVED', 20, :provider, :attempt, :now, :now, :speculative
                 )
             """),
             dict(
                 id=call_id, campaign_id=campaign.id, borrower_id=borrower.id, agent_id=agent_id,
                 approval_id=approval_id, key=f"{campaign.id}:{borrower.id}:{attempt}",
-                provider=campaign.config.provider, attempt=attempt, now=now,
+                provider=campaign.config.provider, attempt=attempt, now=now, speculative=agent_id is None,
             ),
         )
         return call_id
@@ -266,6 +266,26 @@ class CallTransitions:
         )
         return True
 
+    def claim_speculative_answer(self, lease: Lease, campaign: Campaign, now: datetime) -> int | None:
+        call = self.lock_owned(lease, now)
+        if call is None or not call.is_speculative or call.agent_id is not None or call.state_rank != 50:
+            return None
+        replacement = self._available_replacement(campaign, now)
+        if replacement is None:
+            return None
+        self._bind_answer_agent(call, replacement, now)
+        return replacement.id
+
+    def mark_excess_answer(self, lease: Lease, campaign: Campaign, now: datetime) -> None:
+        applied = self.connection.execute(text("""
+            UPDATE calls SET abandoned_at = :now, version = version + 1
+            WHERE id = :id AND lease_owner = :owner AND fencing_token = :token AND lease_until > :now
+                AND state_rank = 50 AND is_speculative AND agent_id IS NULL AND abandoned_at IS NULL RETURNING id
+        """), dict(id=lease.call_id, owner=lease.owner, token=lease.token, now=now)).scalar_one_or_none()
+        if applied is not None:
+            audit(self.connection, now, "call", lease.call_id, "UNCLAIMED_ANSWER", campaign_id=campaign.id,
+                  policy=campaign.config.excess_answer_policy)
+
     def reroute(self, call: RowMapping, campaign: Campaign, now: datetime) -> int | None:
         if call.state_rank != 50 or call.agent_id is None or self.connection.execute(
             text("SELECT 1 FROM audit_log WHERE entity_type = 'call' AND entity_id = :id AND action = 'AGENT_REROUTED' LIMIT 1"),
@@ -276,27 +296,34 @@ class CallTransitions:
         source = agents.get(call.agent_id, lock=True)
         if source.state != AgentState.RECOVERY_HOLD:
             return None
-        replacement = self.connection.execute(
+        replacement = self._available_replacement(campaign, now)
+        if replacement is None:
+            return None
+        self._bind_answer_agent(call, replacement, now, source=source)
+        audit(self.connection, now, "call", call.id, "AGENT_REROUTED", campaign_id=campaign.id, previous=source.id, new=replacement.id)
+        return replacement.id
+
+    def _available_replacement(self, campaign: Campaign, now: datetime) -> RowMapping | None:
+        return self.connection.execute(
             text(f"""
                 SELECT * FROM agents WHERE {AVAILABLE_AGENTS}
                 ORDER BY last_call_ended_at NULLS FIRST, id LIMIT 1 FOR UPDATE SKIP LOCKED
             """),
             availability_params(campaign, now),
         ).mappings().one_or_none()
-        if replacement is None:
-            return None
+
+    def _bind_answer_agent(self, call: RowMapping, replacement: RowMapping, now: datetime, *, source: RowMapping | None = None) -> None:
+        agents = AgentTransitions(self.connection)
         self.connection.execute(
             text("UPDATE calls SET agent_id = :agent, version = version + 1 WHERE id = :id"),
             dict(id=call.id, agent=replacement.id),
         )
-        if not agents.move(source, agents.recovery_target(source), now):
+        if source is not None and not agents.move(source, agents.recovery_target(source), now):
             raise RuntimeError("could not release the previous owner")
         if not agents.move(replacement, AgentState.RESERVED, now, call_id=call.id):
             raise RuntimeError("could not reserve the replacement agent")
         if not agents.move(agents.get(replacement.id), AgentState.DIALING, now):
             raise RuntimeError("could not prepare the replacement agent")
-        audit(self.connection, now, "call", call.id, "AGENT_REROUTED", campaign_id=campaign.id, previous=source.id, new=replacement.id)
-        return replacement.id
 
     def _settle(
         self, call: RowMapping, agents: AgentTransitions, agent: RowMapping | None, now: datetime, campaign: Campaign,

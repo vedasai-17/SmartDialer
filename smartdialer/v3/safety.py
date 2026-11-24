@@ -10,6 +10,7 @@ from .clock import Clock
 from .config import Mode
 from .db import log
 from .pacing import PacingProposal
+from .safety_policy import evaluate_limits
 
 
 class Action(StrEnum):
@@ -26,6 +27,8 @@ class SafetyDecision:
     approved_calls: int
     effective_mode: Mode
     reasons: tuple[str, ...]
+    approved_hard: int = 0
+    approved_speculative: int = 0
 
 
 class SafetyController:
@@ -45,43 +48,31 @@ class SafetyController:
                 decision = self._reject(campaign_id, proposal, requested, "SAFETY_ERROR")
         log(
             "safety_decision", campaign_id=campaign_id, approval_id=decision.id,
-            action=decision.action, approved_calls=decision.approved_calls, reasons=decision.reasons,
+            action=decision.action, approved_calls=decision.approved_calls, approved_speculative=decision.approved_speculative,
+            reasons=decision.reasons,
         )
         return decision
 
     def _decide(self, campaign_id: int, proposal: PacingProposal, requested: int) -> SafetyDecision:
         with self.engine.begin() as connection:
-            campaign = read_campaign(connection, campaign_id)
+            campaign = read_campaign(connection, campaign_id, lock=True)
             if campaign is None:
                 return SafetyDecision(None, Action.REJECT, 0, Mode.STRICT_PROGRESSIVE, ("CAMPAIGN_NOT_FOUND",))
             now = self.clock.now()
             capacity = admission_capacity(connection, campaign, now)
-            approved = min(requested, capacity.limit) if campaign.status == "ACTIVE" else 0
-            reasons = []
-            if campaign.status != "ACTIVE":
-                reasons.append("CAMPAIGN_INACTIVE")
-            if requested == 0:
-                reasons.append("NO_REQUEST")
-            for reason, limit in (
-                ("AVAILABLE_AGENTS", capacity.free_agents),
-                ("CAMPAIGN_CONCURRENCY", capacity.concurrent_slots),
-                ("PROVIDER_RATE_LIMIT", capacity.provider_slots),
-            ):
-                if limit < requested:
-                    reasons.append(reason)
-            if campaign.mode != Mode.STRICT_PROGRESSIVE:
-                reasons.append("PROGRESSIVE_FALLBACK")
+            limits = evaluate_limits(connection, campaign, capacity, requested, now)
             action = Action.APPROVE
-            if approved == 0:
+            if limits.total == 0:
                 action = Action.REJECT
-            elif campaign.mode != Mode.STRICT_PROGRESSIVE:
+            elif limits.mode != campaign.mode:
                 action = Action.FALLBACK_TO_PROGRESSIVE
-            elif approved < requested:
+            elif limits.total < requested:
                 action = Action.REDUCE
-            decision = SafetyDecision(None, action, approved, Mode.STRICT_PROGRESSIVE, tuple(reasons or ["WITHIN_LIMITS"]))
+            decision = SafetyDecision(None, action, limits.total, limits.mode, limits.reasons or ("WITHIN_LIMITS",),
+                                      limits.hard, limits.speculative)
             return self._record(
                 connection, campaign_id, proposal, requested, decision, now,
-                campaign.config.approval_ttl_seconds, asdict(capacity),
+                campaign.config.approval_ttl_seconds, limits.evidence,
             )
 
     def _reject(self, campaign_id: int, proposal: PacingProposal, requested: int, reason: str) -> SafetyDecision:
@@ -103,7 +94,7 @@ class SafetyController:
         decision: SafetyDecision,
         now: datetime,
         ttl_seconds: int,
-        safety_inputs: dict[str, int],
+        safety_inputs: dict[str, object],
     ) -> SafetyDecision:
         decision_id = connection.execute(
             text("""
@@ -120,7 +111,10 @@ class SafetyController:
                 campaign_id=campaign_id, action=decision.action, requested=requested,
                 approved=decision.approved_calls, mode=decision.effective_mode, reasons=list(decision.reasons),
                 pacing_inputs=json.dumps(asdict(proposal.inputs)), reasoning=json.dumps({"summary": proposal.reasoning}),
-                safety_inputs=json.dumps(safety_inputs), now=now, expires_at=now + timedelta(seconds=ttl_seconds),
+                safety_inputs=json.dumps({**safety_inputs, "approved_hard": decision.approved_hard,
+                                          "approved_speculative": decision.approved_speculative}),
+                now=now, expires_at=now + timedelta(seconds=ttl_seconds),
             ),
         ).scalar_one()
-        return SafetyDecision(decision_id, decision.action, decision.approved_calls, decision.effective_mode, decision.reasons)
+        return SafetyDecision(decision_id, decision.action, decision.approved_calls, decision.effective_mode, decision.reasons,
+                              decision.approved_hard, decision.approved_speculative)

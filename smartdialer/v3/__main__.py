@@ -12,7 +12,7 @@ from .agents import AgentState, AgentTransitions
 from .borrowers import BorrowerTransitions
 from .campaigns import read_campaign
 from .clock import Clock, SystemClock
-from .config import CampaignConfig, Settings
+from .config import CampaignConfig, ExcessAnswerPolicy, Mode, Settings
 from .db import database
 from .dialer import Dialer
 
@@ -24,7 +24,7 @@ def positive(raw: str) -> int:
     return value
 
 
-def run_loop(action: Callable[[], object], seconds: int | None, *, interval: float) -> None:
+def run_loop(action: Callable[[], object], seconds: int | None, *, interval: float | Callable[[], float]) -> None:
     from .db import log
 
     deadline = time.monotonic() + seconds if seconds is not None else float("inf")
@@ -33,18 +33,22 @@ def run_loop(action: Callable[[], object], seconds: int | None, *, interval: flo
             action()
         except Exception as error:
             log("worker_iteration_failed", error_type=type(error).__name__)
-        time.sleep(interval)
+        time.sleep(interval() if callable(interval) else interval)
 
 
 def seed(
     connection: Connection, clock: Clock, name: str, agents: int, borrowers: int, config: CampaignConfig,
+    *, mode: Mode = Mode.STRICT_PROGRESSIVE, max_speculative_calls: int = 0, risk_budget: float = 0,
+    max_concurrent_calls: int | None = None, provider_rate_limit: int | None = None,
 ) -> int:
     campaign_id = connection.execute(
         text("""
-            INSERT INTO campaigns (name, max_concurrent_calls, provider_rate_limit, config)
-            VALUES (:name, :agents, :agents, CAST(:config AS jsonb)) RETURNING id
+            INSERT INTO campaigns (name, mode, max_concurrent_calls, provider_rate_limit, max_speculative_calls, risk_budget, config)
+            VALUES (:name, :mode, :concurrent, :rate, :speculative, :risk, CAST(:config AS jsonb)) RETURNING id
         """),
-        dict(name=name, agents=agents, config=config.model_dump_json()),
+        dict(name=name, mode=mode, concurrent=agents if max_concurrent_calls is None else max_concurrent_calls,
+             rate=agents if provider_rate_limit is None else provider_rate_limit, speculative=max_speculative_calls,
+             risk=risk_budget, config=config.model_dump_json()),
     ).scalar_one()
     now = clock.now()
     agent_transitions = AgentTransitions(connection)
@@ -72,7 +76,7 @@ def status(connection: Connection, campaign_id: int) -> dict[str, object]:
     ).all()
     decisions = connection.execute(
         text("""
-            SELECT id, action, requested_calls, approved_calls, reasons, pacing_reasoning, safety_inputs,
+            SELECT id, action, requested_calls, approved_calls, effective_mode, reasons, pacing_inputs, pacing_reasoning, safety_inputs,
                 decided_at, consumed_at FROM safety_decisions
             WHERE campaign_id = :id ORDER BY id DESC LIMIT 5
         """), params,
@@ -92,6 +96,14 @@ def main() -> None:
     seed_command.add_argument("--borrowers", type=positive, default=50)
     seed_command.add_argument("--heartbeat-ttl", type=positive, default=300)
     seed_command.add_argument("--provider", choices=("A", "B"), default="A")
+    seed_command.add_argument("--mode", type=Mode, choices=list(Mode), default=Mode.STRICT_PROGRESSIVE)
+    seed_command.add_argument("--enable-speculation", action="store_true")
+    seed_command.add_argument("--max-speculative-calls", type=int, default=0)
+    seed_command.add_argument("--risk-budget", type=float, default=0)
+    seed_command.add_argument("--max-concurrent-calls", type=positive)
+    seed_command.add_argument("--provider-rate-limit", type=positive)
+    seed_command.add_argument("--excess-answer-policy", type=ExcessAnswerPolicy, choices=list(ExcessAnswerPolicy),
+                              default=ExcessAnswerPolicy.SAFE_TERMINATE)
     tick = commands.add_parser("tick", help="run pacing, safety, and allocation once")
     tick.add_argument("--campaign-id", type=positive, required=True)
     tick.add_argument("--batch-limit", type=positive, default=50)
@@ -118,9 +130,14 @@ def main() -> None:
     clock = SystemClock()
     try:
         if args.command == "seed":
+            if args.max_speculative_calls < 0 or not 0 <= args.risk_budget <= 1:
+                parser.error("speculative cap must be nonnegative and risk budget must be between zero and one")
             with engine.begin() as connection:
-                config = CampaignConfig(heartbeat_ttl_seconds=args.heartbeat_ttl, provider=args.provider)
-                campaign_id = seed(connection, clock, args.name, args.agents, args.borrowers, config)
+                config = CampaignConfig(heartbeat_ttl_seconds=args.heartbeat_ttl, provider=args.provider,
+                                        speculation_enabled=args.enable_speculation, excess_answer_policy=args.excess_answer_policy)
+                campaign_id = seed(connection, clock, args.name, args.agents, args.borrowers, config, mode=args.mode,
+                                   max_speculative_calls=args.max_speculative_calls, risk_budget=args.risk_budget,
+                                   max_concurrent_calls=args.max_concurrent_calls, provider_rate_limit=args.provider_rate_limit)
             result = {"campaign_id": campaign_id, "agents": args.agents, "borrowers": args.borrowers}
         elif args.command == "tick":
             call_ids = Dialer(engine, clock).tick(args.campaign_id, args.batch_limit)
@@ -130,7 +147,8 @@ def main() -> None:
                 result = status(connection, args.campaign_id)
         elif args.command == "dialer":
             dialer = Dialer(engine, clock)
-            run_loop(lambda: dialer.tick(args.campaign_id, args.batch_limit), args.seconds, interval=0.2)
+            run_loop(lambda: dialer.tick(args.campaign_id, args.batch_limit), args.seconds,
+                     interval=lambda: dialer.delay(args.campaign_id, 0.2))
             return
         elif args.command == "agents":
             states = {"online": AgentState.AVAILABLE, "offline": AgentState.OFFLINE, "paused": AgentState.PAUSED}

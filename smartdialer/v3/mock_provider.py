@@ -14,7 +14,9 @@ from .agents import AgentState, AgentTransitions
 from .calls import RANK, CallState, CallTransitions, Lease
 from .campaigns import read_campaign
 from .clock import Clock
+from .health import start_permitted
 from .providers import ProviderRejected, ProviderStatus, ProviderTimeout, ProviderWebhook
+from .safety_policy import speculative_start_allowed
 
 
 class MockProfile(BaseModel):
@@ -104,12 +106,18 @@ class MockProvider:
             row = CallTransitions(connection, clock=self.clock).lock_owned(lease, now, audit_lost=False)
             if row is None or row.idempotency_key != client_reference or row.state_rank != 25:
                 raise ProviderRejected("initiation permit expired")
-            agent = AgentTransitions(connection).get(row.agent_id, lock=True)
+            agent = AgentTransitions(connection).get(row.agent_id, lock=True) if row.agent_id is not None else None
             now = self.clock.now()
-            if agent.state not in {AgentState.RESERVED, AgentState.DIALING} or agent.lease_expires_at is None or (
-                agent.lease_expires_at <= now or row.lease_until <= now or agent.current_call_id != row.id
-            ):
+            if row.lease_until <= now or (agent is not None and (
+                agent.state not in {AgentState.RESERVED, AgentState.DIALING} or agent.lease_expires_at is None
+                or agent.lease_expires_at <= now or agent.current_call_id != row.id
+            )):
                 raise ProviderRejected("initial agent reservation expired")
+            campaign = read_campaign(connection, row.campaign_id)
+            if campaign is None or campaign.status != "ACTIVE" or not speculative_start_allowed(connection, row, campaign, now):
+                raise ProviderRejected("campaign no longer permits this call")
+            if not start_permitted(connection, row, campaign, now):
+                raise ProviderRejected("provider breaker blocks this call")
             if not phone.startswith("999"):
                 raise ProviderRejected("mock accepts synthetic 999-prefix numbers only")
             transport = Random(f"{self.seed}:{self.name}:{client_reference}:send:{row.dispatch_attempts}")
@@ -117,7 +125,7 @@ class MockProvider:
             after_accept = profile.timeout_after_accept if profile.timeout_after_accept is not None else transport.random() < 0.5
             if timeout and not after_accept:
                 raise ProviderTimeout("initiation timed out before mock acceptance")
-            mock_call = self._accept(connection, client_reference, profile, now)
+            mock_call = self._accept(connection, client_reference, profile, now, campaign.config.answer_hold_seconds)
             result = self._snapshot(client_reference, {"accept": mock_call.model_dump(mode="json")}, now)
         if timeout:
             raise ProviderTimeout("mock accepted before the response timed out")
@@ -219,7 +227,7 @@ class MockProvider:
         with self.engine.begin() as connection:
             connection.execute(text("UPDATE call_events SET processed_at = :now WHERE id = :id"), dict(now=self.clock.now(), id=row.id))
 
-    def _accept(self, connection: Connection, ref: str, profile: MockProfile, now: datetime) -> MockCall:
+    def _accept(self, connection: Connection, ref: str, profile: MockProfile, now: datetime, hold_seconds: float) -> MockCall:
         rng = Random(f"{self.seed}:{self.name}:{ref}")
         ringing = now + timedelta(seconds=rng.uniform(profile.setup_min_seconds, profile.setup_max_seconds))
         outcome_at = ringing + timedelta(seconds=profile.ring_seconds)
@@ -229,7 +237,7 @@ class MockProvider:
             outcome = CallState.ANSWERED
         else:
             outcome = CallState.BUSY if rng.random() < 0.2 else CallState.NO_ANSWER
-        hold_until = outcome_at + timedelta(seconds=profile.answer_hold_seconds)
+        hold_until = outcome_at + timedelta(seconds=min(profile.answer_hold_seconds, hold_seconds))
         accepted = MockCall(
             accepted_at=now, ringing_at=ringing, outcome_at=outcome_at, outcome=outcome,
             hold_until=hold_until, talk_seconds=profile.talk_seconds, lose_terminal=rng.random() < profile.lost_terminal_rate,

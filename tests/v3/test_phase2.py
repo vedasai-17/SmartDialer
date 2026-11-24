@@ -17,7 +17,7 @@ from sqlalchemy import Engine, RowMapping, create_engine, text
 from smartdialer.v3.__main__ import seed
 from smartdialer.v3.agents import AgentState, AgentTransitions
 from smartdialer.v3.clock import VirtualClock
-from smartdialer.v3.config import CampaignConfig, DispatchConfig
+from smartdialer.v3.config import BreakerConfig, CampaignConfig, DispatchConfig
 from smartdialer.v3.dialer import Dialer
 from smartdialer.v3.dispatch import Dispatcher
 from smartdialer.v3.events import EventInbox, EventProcessor, create_app
@@ -71,7 +71,9 @@ def prepare(engine: Engine, clock: VirtualClock, provider: str = "A", *, agents:
     mock.configure(answer_rate=1, failure_rate=0, timeout_rate=0, out_of_order_rate=0,
                    duplicate_rate=0, lost_terminal_rate=0, talk_seconds=0.75, ring_seconds=0.3)
     with engine.begin() as connection:
-        campaign = seed(connection, clock, "phase-two", agents, 2, CampaignConfig(provider=provider, heartbeat_ttl_seconds=heartbeat_ttl))
+        campaign = seed(connection, clock, "phase-two", agents, 2, CampaignConfig(
+            provider=provider, heartbeat_ttl_seconds=heartbeat_ttl, breaker=BreakerConfig(min_samples=100),
+        ))
     call_id, = Dialer(engine, clock).tick(campaign, 1)
     return Rig(engine, clock, campaign, call_id, mock, providers, EventInbox(engine, clock, providers), EventProcessor(engine, clock))
 

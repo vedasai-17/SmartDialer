@@ -9,18 +9,20 @@ class Reaper:
         self.engine = engine
         self.clock = clock
 
-    def tick(self, *, limit: int = 100) -> int:
+    def tick(self, *, limit: int = 100, campaign_id: int | None = None, wrapups_only: bool = False) -> int:
         with self.engine.begin() as connection:
             now = self.clock.now()
             rows = connection.execute(
                 text("""
                     SELECT * FROM agents
                     WHERE state NOT IN ('OFFLINE', 'RECOVERY_HOLD')
+                        AND (CAST(:campaign AS bigint) IS NULL OR campaign_id = :campaign)
+                        AND (NOT :wrapups_only OR state = 'WRAP_UP')
                         AND (lease_expires_at IS NULL OR lease_expires_at <= :now
                              OR (state = 'WRAP_UP' AND wrap_up_ends_at <= :now))
                     ORDER BY id LIMIT :limit FOR UPDATE SKIP LOCKED
                 """),
-                dict(now=now, limit=limit),
+                dict(now=now, limit=limit, campaign=campaign_id, wrapups_only=wrapups_only),
             ).mappings().all()
             transitions = AgentTransitions(connection)
             for agent in rows:

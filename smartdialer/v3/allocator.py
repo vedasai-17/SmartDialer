@@ -11,6 +11,7 @@ from .campaigns import AVAILABLE_AGENTS, Campaign, admission_capacity, availabil
 from .clock import Clock
 from .config import Mode
 from .db import audit, log
+from .safety_policy import evaluate_limits
 
 
 class ApprovalRejected(ValueError):
@@ -55,10 +56,23 @@ class Allocator:
             return [], "safety decision is already consumed"
         if not approval.decided_at <= now < approval.expires_at:
             return [], "safety decision is outside its validity window"
-        if approval.approved_calls <= 0 or approval.effective_mode != Mode.STRICT_PROGRESSIVE:
-            return [], "safety decision does not authorize progressive calls"
+        if approval.approved_calls <= 0:
+            return [], "safety decision does not authorize calls"
+        if approval.safety_inputs.get("provider", campaign.config.provider) != campaign.config.provider:
+            return [], "provider changed after approval"
 
-        limit = min(approval.approved_calls, admission_capacity(connection, campaign, now).limit)
+        capacity = admission_capacity(connection, campaign, now)
+        limits = evaluate_limits(connection, campaign, capacity, approval.approved_calls, now)
+        hard = min(limits.hard, approval.safety_inputs.get("approved_hard", approval.approved_calls))
+        speculative = 0
+        if approval.effective_mode == limits.mode == campaign.mode and campaign.mode != Mode.STRICT_PROGRESSIVE:
+            speculative = min(limits.speculative, approval.safety_inputs.get("approved_speculative", 0))
+        current_breaker = limits.evidence["breaker"]
+        issued_breaker = approval.safety_inputs.get("breaker", {})
+        if current_breaker["state"] == "HALF_OPEN" and (
+            issued_breaker.get("state") != "HALF_OPEN" or issued_breaker.get("since") != current_breaker["since"]
+        ):
+            hard = 0
         connection.execute(
             text("""
                 UPDATE safety_decisions SET consumed_at = :now, consumed_in = pg_current_xact_id()
@@ -66,13 +80,15 @@ class Allocator:
             """),
             dict(id=approval_id, now=now),
         ).scalar_one()
-        if limit == 0:
+        if hard + speculative == 0:
             return [], None
-        return self._reserve_pairs(connection, campaign, approval_id, now, limit), None
+        mode = Mode.HYBRID if approval.effective_mode == limits.mode == Mode.HYBRID else Mode.STRICT_PROGRESSIVE
+        return self._reserve_pairs(connection, campaign, approval_id, now, hard, speculative, mode), None
 
     @staticmethod
     def _reserve_pairs(
-        connection: Connection, campaign: Campaign, approval_id: int, now: datetime, limit: int,
+        connection: Connection, campaign: Campaign, approval_id: int, now: datetime, hard: int,
+        speculative: int, mode: Mode,
     ) -> list[UUID]:
         agents = connection.execute(
             text(f"""
@@ -80,9 +96,10 @@ class Allocator:
                 ORDER BY last_call_ended_at NULLS FIRST, id
                 LIMIT :limit FOR UPDATE SKIP LOCKED
             """),
-            {**availability_params(campaign, now), "limit": limit},
+            {**availability_params(campaign, now), "limit": hard},
         ).mappings().all()
-        if not agents:
+        owners = [*agents, *([None] * speculative)]
+        if not owners:
             return []
         borrowers = connection.execute(
             text("""
@@ -95,18 +112,30 @@ class Allocator:
                 ORDER BY b.priority DESC, b.next_attempt_at, b.queued_at, b.attempts, b.id
                 LIMIT :limit FOR UPDATE OF b SKIP LOCKED
             """),
-            dict(campaign_id=campaign.id, now=now, limit=len(agents)),
+            dict(campaign_id=campaign.id, now=now, limit=len(owners)),
         ).mappings().all()
 
         agent_transitions = AgentTransitions(connection)
         borrower_transitions = BorrowerTransitions(connection)
         calls = CallTransitions(connection)
         call_ids = []
-        for agent, borrower in zip(agents, borrowers):
-            call_id = calls.reserve(campaign, borrower, agent.id, approval_id, now)
-            if not agent_transitions.move(agent, AgentState.RESERVED, now, call_id=call_id):
+        for agent, borrower in zip(owners, borrowers):
+            call_id = calls.reserve(campaign, borrower, agent.id if agent is not None else None, approval_id, now)
+            if agent is not None and not agent_transitions.move(agent, AgentState.RESERVED, now, call_id=call_id):
                 raise RuntimeError("failed to reserve the locked agent")
             if not borrower_transitions.move(borrower, BorrowerState.RESERVED, now):
                 raise RuntimeError("failed to reserve the locked borrower")
             call_ids.append(call_id)
+        if mode == Mode.HYBRID and call_ids:
+            staged = connection.execute(text("""
+                SELECT safety_inputs->'prestaged_borrower_ids' FROM safety_decisions
+                WHERE campaign_id = :id AND id < :approval AND effective_mode = 'HYBRID'
+                    AND (safety_inputs->>'prestage_next_ready_at')::timestamptz <= :now
+                    AND decided_at > :now - interval '1 minute'
+                ORDER BY decided_at DESC, id DESC LIMIT 1
+            """), {"id": campaign.id, "approval": approval_id, "now": now}).scalar_one_or_none() or []
+            selected = [borrower.id for borrower in borrowers[:len(agents)] if borrower.id in staged]
+            if selected:
+                audit(connection, now, "safety_decision", approval_id, "PRESTAGED_BORROWERS_RESERVED",
+                      campaign_id=campaign.id, borrower_ids=selected)
         return call_ids

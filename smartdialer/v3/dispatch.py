@@ -11,10 +11,12 @@ from .borrowers import BorrowerState, BorrowerTransitions
 from .calls import RANK, CallState, CallTransitions, Lease, TransitionResult
 from .campaigns import Campaign, read_campaign
 from .clock import Clock
-from .config import DispatchConfig
+from .config import DispatchConfig, ExcessAnswerPolicy
 from .db import audit, log
 from .observations import record_status
+from .health import record_operation, start_permitted
 from .providers import ProviderRejected, ProviderStatus, ProviderTimeout, TelecomProvider
+from .safety_policy import SPECULATION_CANCEL_REQUESTED, cancel_requested, speculative_start_allowed
 
 
 @dataclass(frozen=True)
@@ -85,13 +87,14 @@ class Dispatcher:
         with self.engine.begin() as connection:
             now = self.clock.now()
             call = connection.execute(
-                text("""
+                text(f"""
                     SELECT c.* FROM calls c
                     LEFT JOIN agents a ON a.id = c.agent_id
                     JOIN borrowers b ON b.id = c.borrower_id
                     WHERE c.state_rank BETWEEN 20 AND 99 AND (c.lease_until IS NULL OR c.lease_until <= :now)
                         AND (c.next_retry_at <= :now OR (c.state <> 'UNKNOWN' AND (
                             a.state = 'RECOVERY_HOLD' OR (b.state = 'SUPPRESSED' AND c.state_rank < 60)
+                            OR ({SPECULATION_CANCEL_REQUESTED})
                         )))
                     ORDER BY CASE WHEN a.state = 'RECOVERY_HOLD' THEN 0 WHEN c.state_rank = 50 THEN 1
                                   WHEN c.state_rank > 20 THEN 2 ELSE 3 END, c.next_retry_at, c.id
@@ -135,7 +138,10 @@ class Dispatcher:
         self, calls: CallTransitions, call: RowMapping, work: Work, campaign: Campaign, now: datetime,
     ) -> Operation | None:
         agent = self._agent(calls, call, campaign, now)
-        if campaign.status != "ACTIVE" or agent is None or agent.state not in {AgentState.RESERVED, AgentState.DIALING}:
+        valid_agent = call.is_speculative and agent is None or (
+            agent is not None and agent.state in {AgentState.RESERVED, AgentState.DIALING}
+        )
+        if campaign.status != "ACTIVE" or not valid_agent or not speculative_start_allowed(calls.connection, call, campaign, now):
             if work.new_call:
                 self._end(calls, call, work, campaign, now, CallState.CANCELLED, "RESERVATION_UNAVAILABLE")
                 return None
@@ -150,6 +156,13 @@ class Dispatcher:
             self._end(calls, call, work, campaign, now, CallState.FAILED, "DISPATCH_DEAD_LETTER")
             return None
 
+        if not start_permitted(calls.connection, call, campaign, now):
+            if work.new_call:
+                self._end(calls, call, work, campaign, now, CallState.CANCELLED, "PROVIDER_BREAKER_BLOCKED")
+            else:
+                self._poll_later(calls, work, now)
+            return None
+
         if not self._rate_slot(calls.connection, call, campaign, now):
             calls.release_lease(work.lease, now, now + timedelta(seconds=self.config.retry_base_seconds))
             return None
@@ -161,16 +174,29 @@ class Dispatcher:
     ) -> Operation | None:
         agent = self._agent(calls, call, campaign, now)
         borrower = BorrowerTransitions(calls.connection).get(call.borrower_id, lock=True)
-        if borrower.state == BorrowerState.SUPPRESSED and call.state_rank < 60:
+        if (borrower.state == BorrowerState.SUPPRESSED and call.state_rank < 60) or cancel_requested(calls.connection, call):
+            if call.state_rank == 50:
+                calls.mark_excess_answer(work.lease, campaign, now)
             return Operation("cancel")
         if call.state_rank == 50:
-            if now >= call.answered_at + timedelta(seconds=self.config.answer_hold_seconds):
+            deadline = call.answered_at + timedelta(seconds=min(self.config.answer_hold_seconds, campaign.config.answer_hold_seconds))
+            if now >= deadline:
+                calls.mark_excess_answer(work.lease, campaign, now)
+                return Operation("cancel")
+            if call.is_speculative and agent is None:
+                owner = calls.claim_speculative_answer(work.lease, campaign, now)
+                if owner is not None:
+                    return Operation("bridge", agent_id=owner)
+                calls.mark_excess_answer(work.lease, campaign, now)
+                if campaign.config.excess_answer_policy == ExcessAnswerPolicy.SHORT_HOLD:
+                    calls.release_lease(work.lease, now, min(deadline, now + timedelta(seconds=0.1)))
+                    return None
                 return Operation("cancel")
             if calls.ready_to_bridge(call, agent, now, campaign):
                 return Operation("bridge", agent_id=agent.id)
             replacement = calls.reroute(call, campaign, now)
             return Operation("bridge", agent_id=replacement) if replacement is not None else Operation("cancel")
-        if agent is None or agent.state == AgentState.RECOVERY_HOLD:
+        if (agent is None and not call.is_speculative) or (agent is not None and agent.state == AgentState.RECOVERY_HOLD):
             return Operation("cancel")
         self._poll_later(calls, work, now)
         return None
@@ -205,6 +231,8 @@ class Dispatcher:
             if campaign is None:
                 return
             result = record_status(calls, call, campaign, now, status, lease=work.lease)
+            if operation == "initiate" and result != TransitionResult.INVALID:
+                record_operation(connection, call, now, work.lease.token, operation, "OK")
             if result == TransitionResult.INVALID:
                 self._defer(calls, call, work, campaign, now, "INVALID_PROVIDER_STATUS", operation)
             else:
@@ -233,8 +261,10 @@ class Dispatcher:
         self, calls: CallTransitions, call: RowMapping, work: Work, campaign: Campaign,
         now: datetime, reason: str, operation: str,
     ) -> None:
-        if call.state != CallState.UNKNOWN:
+        if call.state != CallState.UNKNOWN and not (operation == "status" and call.state_rank == 60):
             calls.advance(call.id, CallState.UNKNOWN, now, campaign, failure_reason=reason, lease=work.lease)
+        result = "TIMEOUT" if reason.endswith("_TIMEOUT") else "ERROR"
+        record_operation(calls.connection, call, now, work.lease.token, operation, result)
         audit(calls.connection, now, "call", call.id, "PROVIDER_UNCERTAIN", campaign_id=campaign.id,
               provider=work.provider, reason=reason, operation=operation, token=work.lease.token)
         failures = calls.connection.execute(

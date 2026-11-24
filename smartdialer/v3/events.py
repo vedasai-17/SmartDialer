@@ -219,6 +219,7 @@ def create_app(inbox: EventInbox, background: Callable[[], None] | None = None) 
             calls = connection.execute(text("SELECT state, count(*) FROM calls GROUP BY state")).all()
             events = connection.execute(text("""
                 SELECT processing_status, count(*) FROM call_events WHERE provider_name NOT LIKE 'mock:%'
+                    AND event_type <> 'PROVIDER_OPERATION'
                 GROUP BY processing_status
             """)).all()
             outcomes = connection.execute(text("""
