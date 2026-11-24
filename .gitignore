@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+.venv/
+.smartdialer/
+dist/
+*.sqlite3*
+/Tech Assignment - Hiring 2026 (1).pdf
