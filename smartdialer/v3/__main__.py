@@ -1,0 +1,202 @@
+import argparse
+import json
+import logging
+import os
+import time
+from collections.abc import Callable
+from uuid import uuid4
+
+from sqlalchemy import Connection, Engine, text
+
+from .agents import AgentState, AgentTransitions
+from .borrowers import BorrowerTransitions
+from .campaigns import read_campaign
+from .clock import Clock, SystemClock
+from .config import CampaignConfig, Settings
+from .db import database
+from .dialer import Dialer
+
+
+def positive(raw: str) -> int:
+    value = int(raw)
+    if value <= 0:
+        raise argparse.ArgumentTypeError("expected a positive integer")
+    return value
+
+
+def run_loop(action: Callable[[], object], seconds: int | None, *, interval: float) -> None:
+    from .db import log
+
+    deadline = time.monotonic() + seconds if seconds is not None else float("inf")
+    while time.monotonic() < deadline:
+        try:
+            action()
+        except Exception as error:
+            log("worker_iteration_failed", error_type=type(error).__name__)
+        time.sleep(interval)
+
+
+def seed(
+    connection: Connection, clock: Clock, name: str, agents: int, borrowers: int, config: CampaignConfig,
+) -> int:
+    campaign_id = connection.execute(
+        text("""
+            INSERT INTO campaigns (name, max_concurrent_calls, provider_rate_limit, config)
+            VALUES (:name, :agents, :agents, CAST(:config AS jsonb)) RETURNING id
+        """),
+        dict(name=name, agents=agents, config=config.model_dump_json()),
+    ).scalar_one()
+    now = clock.now()
+    agent_transitions = AgentTransitions(connection)
+    borrower_transitions = BorrowerTransitions(connection)
+    for _ in range(agents):
+        agent_id = connection.execute(
+            text("INSERT INTO agents (campaign_id) VALUES (:id) RETURNING id"), {"id": campaign_id},
+        ).scalar_one()
+        if not agent_transitions.move(
+            agent_transitions.get(agent_id), AgentState.AVAILABLE, now,
+            login_ttl_seconds=config.heartbeat_ttl_seconds,
+        ):
+            raise RuntimeError("could not seed agent presence")
+    for offset in range(borrowers):
+        synthetic = f"999{campaign_id:06d}{offset:06d}"
+        if borrower_transitions.enqueue(campaign_id, synthetic, now) is None:
+            raise RuntimeError("synthetic borrower already exists")
+    return campaign_id
+
+
+def status(connection: Connection, campaign_id: int) -> dict[str, object]:
+    params = {"id": campaign_id}
+    calls = connection.execute(
+        text("SELECT state, count(*) FROM calls WHERE campaign_id = :id GROUP BY state"), params,
+    ).all()
+    decisions = connection.execute(
+        text("""
+            SELECT id, action, requested_calls, approved_calls, reasons, pacing_reasoning, safety_inputs,
+                decided_at, consumed_at FROM safety_decisions
+            WHERE campaign_id = :id ORDER BY id DESC LIMIT 5
+        """), params,
+    ).mappings()
+    agents = connection.execute(
+        text("SELECT state, count(*) FROM agents WHERE campaign_id = :id GROUP BY state"), params,
+    ).all()
+    return {"campaign_id": campaign_id, "calls": dict(calls), "agents": dict(agents), "decisions": [dict(row) for row in decisions]}
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Run the SmartDialer v3 PostgreSQL prototype")
+    commands = parser.add_subparsers(dest="command", required=True)
+    seed_command = commands.add_parser("seed", help="create a campaign with synthetic records")
+    seed_command.add_argument("--name", default="progressive-demo")
+    seed_command.add_argument("--agents", type=positive, default=10)
+    seed_command.add_argument("--borrowers", type=positive, default=50)
+    seed_command.add_argument("--heartbeat-ttl", type=positive, default=300)
+    seed_command.add_argument("--provider", choices=("A", "B"), default="A")
+    tick = commands.add_parser("tick", help="run pacing, safety, and allocation once")
+    tick.add_argument("--campaign-id", type=positive, required=True)
+    tick.add_argument("--batch-limit", type=positive, default=50)
+    show = commands.add_parser("status", help="show campaign call counts and safety decisions")
+    show.add_argument("--campaign-id", type=positive, required=True)
+    dial = commands.add_parser("dialer", help="continuously pace and allocate")
+    dial.add_argument("--campaign-id", type=positive, required=True)
+    dial.add_argument("--batch-limit", type=positive, default=50)
+    dial.add_argument("--seconds", type=positive)
+    dispatch = commands.add_parser("dispatcher", help="dispatch and reconcile leased calls")
+    dispatch.add_argument("--worker-id", default=f"{os.getpid()}-{uuid4().hex[:8]}")
+    dispatch.add_argument("--seconds", type=positive)
+    events = commands.add_parser("events", help="serve signed webhooks and process the inbox")
+    events.add_argument("--port", type=positive, default=8000)
+    presence = commands.add_parser("agents", help="change agent presence")
+    presence.add_argument("state", choices=("online", "offline", "paused"))
+    presence.add_argument("ids", nargs="+", type=positive)
+    mock = commands.add_parser("mock-config", help="change a shared mock provider profile")
+    mock.add_argument("--provider", choices=("A", "B"), required=True)
+    mock.add_argument("--set", action="append", default=[], metavar="FIELD=VALUE")
+    args = parser.parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    engine = database(Settings())
+    clock = SystemClock()
+    try:
+        if args.command == "seed":
+            with engine.begin() as connection:
+                config = CampaignConfig(heartbeat_ttl_seconds=args.heartbeat_ttl, provider=args.provider)
+                campaign_id = seed(connection, clock, args.name, args.agents, args.borrowers, config)
+            result = {"campaign_id": campaign_id, "agents": args.agents, "borrowers": args.borrowers}
+        elif args.command == "tick":
+            call_ids = Dialer(engine, clock).tick(args.campaign_id, args.batch_limit)
+            result = {"campaign_id": args.campaign_id, "calls_reserved": len(call_ids)}
+        elif args.command == "status":
+            with engine.connect() as connection:
+                result = status(connection, args.campaign_id)
+        elif args.command == "dialer":
+            dialer = Dialer(engine, clock)
+            run_loop(lambda: dialer.tick(args.campaign_id, args.batch_limit), args.seconds, interval=0.2)
+            return
+        elif args.command == "agents":
+            states = {"online": AgentState.AVAILABLE, "offline": AgentState.OFFLINE, "paused": AgentState.PAUSED}
+            changed = []
+            with engine.begin() as connection:
+                transitions = AgentTransitions(connection)
+                for agent_id in sorted(set(args.ids)):
+                    agent = transitions.get(agent_id)
+                    campaign = read_campaign(connection, agent.campaign_id)
+                    if campaign is not None and transitions.request_presence(
+                        agent_id, states[args.state], clock.now(), campaign.config.heartbeat_ttl_seconds,
+                    ):
+                        changed.append(agent_id)
+            result = {"state_requested": args.state, "agents": changed}
+        else:
+            run_provider_command(args, engine, clock, parser)
+            return
+        print(json.dumps(result, default=str))
+    except KeyboardInterrupt:
+        pass
+    finally:
+        engine.dispose()
+
+
+def run_provider_command(args: argparse.Namespace, engine: Engine, clock: Clock, parser: argparse.ArgumentParser) -> None:
+    from .mock_provider import MockProfile, mock_providers
+
+    providers = mock_providers(engine, clock)
+    if args.command == "dispatcher":
+        from .dispatch import Dispatcher
+        from .reaper import Reaper
+
+        worker = Dispatcher(engine, clock, providers, args.worker_id)
+        reaper = Reaper(engine, clock)
+
+        def work() -> None:
+            reaper.tick()
+            worker.drain(limit=50)
+
+        run_loop(work, args.seconds, interval=0.05)
+    elif args.command == "events":
+        import uvicorn
+
+        from .events import EventInbox, EventProcessor, create_app
+
+        inbox = EventInbox(engine, clock, providers)
+        processor = EventProcessor(engine, clock)
+
+        def receive() -> None:
+            for provider in providers.values():
+                provider.deliver_ready(inbox.receive)
+            processor.drain()
+
+        uvicorn.run(create_app(inbox, receive), host="127.0.0.1", port=args.port, access_log=False)
+    else:
+        overrides = {}
+        for override in args.set:
+            field, separator, value = override.partition("=")
+            if not separator or field not in MockProfile.model_fields:
+                parser.error(f"invalid mock setting {field!r}")
+            try:
+                overrides[field] = json.loads(value)
+            except json.JSONDecodeError:
+                overrides[field] = value
+        print(providers[args.provider].configure(**overrides).model_dump_json())
+
+
+if __name__ == "__main__":
+    main()

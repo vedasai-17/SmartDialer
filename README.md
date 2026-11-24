@@ -1,5 +1,46 @@
 # SmartDialer
 
+## PostgreSQL v3 — Phase 2
+
+The v3 entry point runs progressive pacing, records an independent Safety decision, and reserves one eligible agent and one eligible borrower per call. The dispatcher leases committed calls, and the events process durably receives signed callbacks, applies state transitions, and serves metrics. Provider A and B are seeded synthetic mocks. [Design and trade-offs](docs/ADR.md)
+
+From the checkout root in PowerShell, use Python 3.12 and a running Docker engine.
+
+```powershell
+docker compose up -d --wait
+py -3.12 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements-v3.txt
+.\.venv\Scripts\python.exe -m alembic upgrade head
+.\.venv\Scripts\python.exe -m smartdialer.v3 seed --agents 10 --borrowers 50 --provider A
+```
+
+Run each worker in its own terminal. Use the `campaign_id` printed by `seed` and start the workers within five minutes while the synthetic seed heartbeats are fresh. The reaper expires those heartbeats unless an agent client renews them.
+
+```powershell
+.\.venv\Scripts\python.exe -m smartdialer.v3 events --port 8000
+.\.venv\Scripts\python.exe -m smartdialer.v3 dispatcher
+.\.venv\Scripts\python.exe -m smartdialer.v3 dialer --campaign-id 1
+```
+
+Run `tick --campaign-id 1` in place of `dialer` for a single allocation cycle. Both dialer and dispatcher accept `--seconds` for a bounded run. Start another dispatcher to exercise concurrent leases. Run another events process on a different port to exercise concurrent inbox processing.
+
+```powershell
+.\.venv\Scripts\python.exe -m smartdialer.v3 status --campaign-id 1
+Invoke-RestMethod http://127.0.0.1:8000/metrics
+.\.venv\Scripts\python.exe -m smartdialer.v3 agents paused 1
+.\.venv\Scripts\python.exe -m smartdialer.v3 mock-config --provider A --set outage=true
+.\.venv\Scripts\python.exe -m smartdialer.v3 mock-config --provider A --set outage=false
+.\.venv\Scripts\python.exe -m pytest -q tests/v3
+```
+
+Use `seed --name another-demo --provider B` to compare the same code with the slower mock. Runtime changes apply to all workers through the provider's mock profile. To change mock setup latency, pass both `--set setup_min_seconds=1` and `--set setup_max_seconds=2`. Defaults are simulation inputs.
+
+With a local PostgreSQL 16 instance, set `SMARTDIALER_DATABASE_URL` to a `postgresql+psycopg://` URL in each terminal. Set `SMARTDIALER_TEST_DATABASE_URL` to test a separate database. Tests create and remove a uniquely named schema in the configured database.
+
+The webhook endpoint is `POST /webhooks/{provider}`. Mock signatures use HMAC-SHA256 over the exact request bytes in the `X-SmartDialer-Signature` header, formatted as `sha256=<hex>`. `SMARTDIALER_MOCK_A_SECRET` and `SMARTDIALER_MOCK_B_SECRET` override the local mock keys. The metrics endpoint reports the call and inbox state counts, answered calls, and abandonment rate.
+
+## Earlier SQLite prototype
+
 SmartDialer is a local collections dialer prototype with progressive and predictive pacing, transactional call admission, two mock telecom providers, and optional ML-based borrower ranking. It uses synthetic records and simulated calls.
 
 Start with `python -m smartdialer demo` from the project folder. The submission ZIP includes the source, tests, architecture and demo notes, and recorded benchmark reports under `evidence/`.
